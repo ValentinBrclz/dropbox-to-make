@@ -1,0 +1,31 @@
+name = "dropbox-to-make"
+main = "src/index.ts"
+compatibility_date = "2026-07-23"
+
+# KV namespace for cursor, cached token, and dedup markers.
+# Create it first:
+#   npx wrangler kv namespace create STATE
+# Then paste the returned ID below.
+[[kv_namespaces]]
+binding = "STATE"
+id = "6ef0bc9a09da4bb58b69ac0e5394d4fc"
+
+# Optional safety net: reconcile every 30 minutes to catch missed webhooks.
+# Remove this section if the webhook should be the only trigger.
+[triggers]
+crons = ["*/30 * * * *"]
+
+[observability]
+enabled = true
+
+# Secrets are NOT stored here. Set them with `wrangler secret put`:
+[secrets]
+required = [
+  "DROPBOX_APP_KEY",
+  "DROPBOX_APP_SECRET",
+  "DROPBOX_REFRESH_TOKEN",
+  "DROPBOX_SOURCE",
+  "MAKE_WEBHOOK_URL",
+  "MAKE_SHARED_SECRET",
+]
+

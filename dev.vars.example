@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local `wrangler dev`. Do NOT commit .dev.vars.
+DROPBOX_APP_KEY=""
+DROPBOX_APP_SECRET=""
+DROPBOX_REFRESH_TOKEN=""
+MAKE_WEBHOOK_URL=""
+MAKE_SHARED_SECRET=""

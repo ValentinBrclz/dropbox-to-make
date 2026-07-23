@@ -1,0 +1,37 @@
+# build outputs
+dist
+dist-ssr
+*.local
+.output/
+.cache
+
+# dependencies
+node_modules/
+
+# logs
+*.log
+logs
+npm-debug.log*
+
+# environment variables
+.env
+.env.*
+!.env.example
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+
+# wrangler files
+.wrangler
+
+# Agent config
+.claude
+.opencode
+opencode.json
+repomix-output.xml
+
+# other
+.DS_Store
+*.patch
+*.rej

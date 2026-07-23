@@ -1,0 +1,19 @@
+{
+  "name": "dropbox-to-make",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dropbox webhook shim that forwards new-file events to Make.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "generate-types": "wrangler types",
+    "check-types": "wrangler types --check",
+    "typecheck": "wrangler types && tsc --noEmit",
+    "test": "npm run typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "wrangler": "^4.113.0"
+  }
+}

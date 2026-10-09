@@ -2,5 +2,7 @@
 DROPBOX_APP_KEY=""
 DROPBOX_APP_SECRET=""
 DROPBOX_REFRESH_TOKEN=""
+# Comma-separated folders, watched non-recursively. Empty or "/" = Dropbox root.
+DROPBOX_SOURCE="/Scans,/Inbox/Invoices"
 MAKE_WEBHOOK_URL=""
 MAKE_SHARED_SECRET=""

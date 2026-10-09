@@ -1,107 +1,64 @@
-# Dropbox to Make classification shim
+# dropbox-to-make
 
-A Cloudflare Worker that turns Dropbox file events into clean webhook calls to Make. The Worker does only the hard Dropbox part (signature verification, cursor resolution, deduplication). Make does the classification, renaming, filing, original move, and logging.
+Cloudflare Worker that receives Dropbox webhooks and forwards new PDF files to a Make webhook.
 
-```
-ScanSnap (OCR on) -> [SOURCE]
-  -> Dropbox webhook -> Cloudflare Worker (this repo)
-        verify signature, resolve changed file via cursor, dedup
-  -> POST metadata to Make webhook
-        Make: download -> AI classify -> rename -> file to CUR tree
-              -> move original to processed subfolder -> append log
-```
+It verifies the Dropbox signature, resolves what changed using a stored cursor per folder, keeps only `.pdf` files placed **directly** in the watched folders (sub-folders are ignored), deduplicates them, and POSTs their metadata to Make. File bytes are not forwarded; Make downloads the file through its own Dropbox connection.
 
-The Worker forwards file metadata (path, id, rev, size), not the file bytes. Make downloads the PDF itself through its own Dropbox connection, which keeps the Worker tiny and avoids pushing base64 through the webhook.
+## Configuration
 
-## Prerequisites
+| Secret                  | Description                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `DROPBOX_APP_KEY`       | Dropbox app key.                                                                                              |
+| `DROPBOX_APP_SECRET`    | Dropbox app secret (also used to verify webhook signatures).                                                  |
+| `DROPBOX_REFRESH_TOKEN` | Long-lived Dropbox refresh token.                                                                              |
+| `DROPBOX_SOURCE`        | Comma-separated folders to watch, non-recursively, e.g. `/Scans,/Inbox/Invoices`. Empty or `/` = Dropbox root. |
+| `MAKE_WEBHOOK_URL`      | Make custom webhook URL.                                                                                       |
+| `MAKE_SHARED_SECRET`    | Random string sent as `X-Make-Apikey`; filter on it in Make.                                                   |
 
-- A Cloudflare account with Workers (free plan is sufficient at 30 to 150 documents/month).
-- Node.js and `wrangler` installed (`npm i -g wrangler`), then `wrangler login`.
-- A Dropbox account (the personal one that receives the scanner output).
-- A Make account with one scenario (built below).
+State is stored in the `STATE` KV namespace (cursors, cached access token, 24h dedup markers).
 
-## 1. Create a Dropbox app
+## Setup
 
-1. Go to the Dropbox App Console and create an app.
-2. Access type: **Full Dropbox** if the CUR tree lives outside an app folder, or **App folder** if you scope everything under one folder. The Worker filters to the source folder either way.
-3. Permissions (scopes): `files.metadata.read`, `files.content.read`.
-4. Note the **App key** and **App secret**.
-
-Note: Make needs `files.content.write` and `files.content.read` on its own Dropbox connection for the move and upload steps; that is separate from this app.
-
-## 2. Get a Dropbox refresh token (one time)
-
-Dropbox access tokens are short lived, so the Worker uses a long-lived refresh token.
-
-1. In a browser, authorize the app with offline access (replace `APP_KEY`):
-   ```
-   https://www.dropbox.com/oauth2/authorize?client_id=APP_KEY&token_access_type=offline&response_type=code
-   ```
-2. Copy the authorization `code` Dropbox shows you.
-3. Exchange it for a refresh token (replace `CODE`, `APP_KEY`, `APP_SECRET`):
+1. **Dropbox app**: create one in the Dropbox App Console with scopes `files.metadata.read` and `files.content.read`.
+2. **Refresh token**: open
+   `https://www.dropbox.com/oauth2/authorize?client_id=APP_KEY&token_access_type=offline&response_type=code`,
+   then exchange the code:
    ```bash
    curl https://api.dropbox.com/oauth2/token \
-     -d code=CODE \
-     -d grant_type=authorization_code \
-     -d client_id=APP_KEY \
-     -d client_secret=APP_SECRET
+     -d code=CODE -d grant_type=authorization_code \
+     -d client_id=APP_KEY -d client_secret=APP_SECRET
    ```
-4. Store the `refresh_token` from the JSON response.
+3. **KV namespace**: `npx wrangler kv namespace create STATE`, then put the returned `id` in `wrangler.toml`.
+4. **Secrets**: `npx wrangler secret put <NAME>` for each secret above.
+5. **Deploy**: `npm run deploy`.
+6. **Webhook**: add the Worker URL under **Webhooks** in the Dropbox App Console. The Worker answers the verification challenge automatically.
 
-## 3. Create the KV namespace
+For local development, copy `dev.vars.example` to `.dev.vars` and run `npm run dev`.
 
-```bash
-wrangler kv namespace create STATE
+## Behaviour
+
+- The first run for a folder forwards the PDFs already in it, then only new ones.
+- A folder's cursor only advances when every forward succeeded; failures are retried on the next webhook or cron run.
+- A cron (`*/30 * * * *` in `wrangler.toml`) reconciles in case a webhook is missed. Remove it to rely on webhooks only.
+- Moving a processed file out of a watched folder (e.g. into a sub-folder) does not re-trigger it.
+
+## Payload sent to Make
+
+```json
+{
+  "event": "new_file",
+  "source": "dropbox-classement-worker",
+  "ts": "2026-01-01T12:00:00.000Z",
+  "dedup_key": "id:abc:015f...",
+  "dropbox": {
+    "id": "id:abc",
+    "name": "scan.pdf",
+    "path_lower": "/scans/scan.pdf",
+    "path_display": "/Scans/scan.pdf",
+    "rev": "015f...",
+    "size": 123456,
+    "server_modified": "2026-01-01T11:59:58Z",
+    "content_hash": "..."
+  }
+}
 ```
-
-Paste the returned `id` into `wrangler.toml`.
-
-## 4. Set secrets and th
-
-e intake folder
-
-```bash
-wrangler secret put DROPBOX_APP_KEY
-wrangler secret put DROPBOX_APP_SECRET
-wrangler secret put DROPBOX_REFRESH_TOKEN
-wrangler secret put DROPBOX_SOURCE
-wrangler secret put MAKE_WEBHOOK_URL        # from step 7 (Make custom webhook URL)
-wrangler secret put MAKE_SHARED_SECRET      # any long random string you choose
-```
-
-## 5. Deploy
-
-```bash
-wrangler deploy
-```
-
-Note the deployed URL, for example `https://dropbox-to-make.<subdomain>.workers.dev`.
-
-## 6. Register the webhook in Dropbox
-
-1. In the Dropbox App Console, under **Webhooks**, add the Worker URL.
-2. Dropbox immediately sends a GET challenge; the Worker echoes it, so the webhook shows **Enabled**.
-3. The first real notification initializes the cursor and processes no backlog by design (only files added after this moment are forwarded). To also process what is already sitting in the intake folder, delete the `cursor` key from KV once, or drop a fresh copy of each file in.
-
-## 7. Build the Make scenario
-
-Create one scenario fit to the handling you need.
-
-1. **Webhook (custom webhook)** trigger. Copy its URL into `MAKE_WEBHOOK_URL` (step 4).
-2. **Filter** right after the trigger: continue only if `X-MAKE-APIKEY` header equals your `MAKE_SHARED_SECRET`. This rejects anything not from the Worker.
-3. **Dropbox > Download a file**, using `dropbox.path_lower` from the payload.
-4. **AI classification** (OpenAI / Gemini / Anthropic module, your choice for accuracy). Send the PDF (or its extracted text) with your prompt. Enforce the JSON schema in the prompt.
-5. **Parse JSON** on the model output (reuse your existing schema).
-6. Build the values / routers / etc.
-7. **Dropbox > Upload a file** at the chosen destination with `newFileName`. Choose autorename or overwrite on collision (your call).
-8. **Dropbox > Move a file**: move the original from the intake folder to a processed subfolder. The Worker watches the intake folder non-recursively, so this move does not re-trigger.
-9. **Logging**: append a CSV line (timestamp, original name, person_path, document_type, newFileName, needs_review, amount_chf, deadline_iso) to a Dropbox log file, mirroring your current log. Optional: add a Teams or Slack notification for successes and errors.
-
-## Notes and limits
-
-- **Response timing**: Dropbox requires a response within about 10 seconds. The Worker answers 200 immediately and does the work in `waitUntil`, so a burst of scans is safe.
-- **Deduplication**: the Worker keys on `id:rev` with a 24h TTL to guard against Dropbox sending several notifications for the same change. Because Make moves originals out of the intake folder, re-listing does not re-forward them anyway.
-- **Missed webhooks**: the optional 30-minute cron in `wrangler.jsonc` reconciles using the same cursor. Remove it if you want the webhook to be the sole trigger.
-- **Cost at your volume**: Worker requests, KV operations and the cron all sit inside the Cloudflare free tier for 30 to 150 documents/month. Make Core (~9 USD/month) covers the classification and filing; a webhook-triggered Make scenario consumes one operation per real event, not per poll.
-- **Single account**: the Worker assumes one Dropbox account (one refresh token). Multi-account would add an account-to-token lookup in `processChanges`.
-- **PDF size**: at up to ~10 pages the Worker never touches the bytes (it forwards metadata), so size is a non-issue on the Worker side; watch Make's monthly data-transfer allowance if documents grow.

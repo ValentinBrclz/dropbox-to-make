@@ -1,29 +1,37 @@
 /**
- * Dropbox -> Make webhook shim (Cloudflare Worker)
- * ------------------------------------------------
- * Role: this Worker is ONLY the Dropbox hook. It does not classify or move files.
+ * Dropbox -> Make webhook shim (Cloudflare Worker).
+ *
+ * This Worker is ONLY the Dropbox hook: it does not classify or move files.
  *
  * Flow:
  *   1. Dropbox sends a webhook notification ("an account changed", no file path).
- *   2. The Worker verifies the X-Dropbox-Signature (HMAC-SHA256 over the raw body).
- *   3. It answers 200 immediately (Dropbox requires a response within ~10s),
- *      then does the real work asynchronously via ctx.waitUntil.
- *   4. It resolves what actually changed with files/list_folder/continue using a
- *      stored cursor, keeps only new PDFs that sit directly in the intake folder,
- *      deduplicates them, and forwards each file's metadata to the Make webhook.
+ *   2. The Worker verifies X-Dropbox-Signature (HMAC-SHA256 over the raw body).
+ *   3. It answers 200 immediately (Dropbox requires a response within ~10s)
+ *      and does the real work asynchronously via `ctx.waitUntil`.
+ *   4. For each watched folder, it resolves what changed with
+ *      `files/list_folder/continue` using a stored cursor, keeps only new PDFs
+ *      that sit directly in that folder, deduplicates them, and forwards each
+ *      file's metadata to the Make webhook.
+ *
+ * Watched folders come from the `DROPBOX_SOURCE` secret: a comma-separated list
+ * of Dropbox paths (e.g. `/Scans,/Inbox/Invoices`). Each folder is watched
+ * non-recursively. An empty value or `/` means the Dropbox root.
  *
  * State (Cloudflare KV, binding STATE):
- *   - "cursor"            : the Dropbox list_folder cursor for the intake folder
- *   - "token"             : cached Dropbox access token (JSON: {access_token, exp})
- *   - "seen:<id>:<rev>"   : dedup marker, short TTL (guards against burst duplicates)
+ *   - `cursor:<folder>`  : Dropbox list_folder cursor, one per watched folder
+ *   - `token`            : cached Dropbox access token (JSON: {access_token, exp})
+ *   - `seen:<id>:<rev>`  : dedup marker with a 24h TTL
  *
- * Single Dropbox account is assumed (one refresh token).
+ * A single Dropbox account is assumed (one refresh token).
+ *
+ * @module
  */
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
 /* -------------------------------------------------------------------------- */
 
+/** Subset of a Dropbox `Metadata` entry returned by `files/list_folder`. */
 interface DbxEntry {
   ".tag": "file" | "folder" | "deleted";
   id: string;
@@ -36,36 +44,74 @@ interface DbxEntry {
   content_hash?: string;
 }
 
+/** Response of `files/list_folder` and `files/list_folder/continue`. */
 interface DbxListResult {
   entries: DbxEntry[];
   cursor: string;
   has_more: boolean;
 }
 
+/** Entries collected from a listing, plus the cursor to resume from. */
+interface ListOutcome {
+  entries: DbxEntry[];
+  newCursor: string;
+}
+
+/** Error raised when a Dropbox API call fails with a non-retryable status. */
+class DropboxError extends Error {
+  /**
+   * @param endpoint - Dropbox RPC endpoint that failed (e.g. `/files/list_folder`).
+   * @param status - HTTP status code returned by Dropbox.
+   * @param body - Raw response body (Dropbox error JSON or text).
+   * @param requestId - Value of the `x-dropbox-request-id` response header.
+   */
+  constructor(
+    readonly endpoint: string,
+    readonly status: number,
+    readonly body: string,
+    readonly requestId: string,
+  ) {
+    super(
+      `Dropbox ${endpoint} failed status=${status} requestId=${requestId} response=${body}`,
+    );
+    this.name = "DropboxError";
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Config                                                                     */
 /* -------------------------------------------------------------------------- */
+
 const DBX_API = "https://api.dropboxapi.com/2";
 const DBX_OAUTH = "https://api.dropbox.com/oauth2/token";
-const SEEN_TTL_SECONDS = 60 * 60 * 24; // 24h dedup window
+/** Dedup window for `seen:<id>:<rev>` markers. */
+const SEEN_TTL_SECONDS = 60 * 60 * 24;
+/** Retries for 429 / 5xx Dropbox responses (on top of the first attempt). */
 const MAX_DROPBOX_RETRIES = 4;
 
 /* -------------------------------------------------------------------------- */
-/* Default                                                                    */
+/* Entry points                                                               */
 /* -------------------------------------------------------------------------- */
 
 export default {
-  /** HTTP entry point: GET = webhook verification, POST = change notification. */
+  /**
+   * HTTP entry point.
+   * - `GET`: Dropbox webhook verification; echoes the `challenge` query param.
+   * - `POST`: change notification; verifies the signature, acknowledges, then
+   *   processes changes in the background.
+   *
+   * @param request - Incoming request from Dropbox.
+   * @param env - Worker bindings and secrets.
+   * @param ctx - Execution context, used to run work after the response.
+   * @returns The HTTP response sent back to Dropbox.
+   */
   async fetch(
     request: Request,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
-    const url = new URL(request.url);
-
-    // Dropbox webhook verification handshake: echo back the challenge.
     if (request.method === "GET") {
-      const challenge = url.searchParams.get("challenge") ?? "";
+      const challenge = new URL(request.url).searchParams.get("challenge") ?? "";
       return new Response(challenge, {
         headers: {
           "Content-Type": "text/plain",
@@ -75,21 +121,15 @@ export default {
     }
 
     if (request.method === "POST") {
-      // Read the RAW body once; needed both for signature check and (ignored) JSON.
+      // The signature is computed over the exact raw body.
       const raw = await request.text();
       const signature = request.headers.get("X-Dropbox-Signature") ?? "";
 
-      const valid = await verifySignature(
-        raw,
-        signature,
-        env.DROPBOX_APP_SECRET,
-      );
-      if (!valid) {
+      if (!(await verifySignature(raw, signature, env.DROPBOX_APP_SECRET))) {
         console.warn("Rejected webhook: invalid signature");
         return new Response("invalid signature", { status: 403 });
       }
 
-      // Acknowledge fast, process out of band.
       ctx.waitUntil(
         processChanges(env).catch((e) =>
           console.error("processChanges failed", e),
@@ -101,7 +141,13 @@ export default {
     return new Response("method not allowed", { status: 405 });
   },
 
-  /** Optional safety net: reconcile on a schedule in case a webhook was missed. */
+  /**
+   * Cron entry point: reconciles on a schedule in case a webhook was missed.
+   *
+   * @param _event - Scheduled event (unused).
+   * @param env - Worker bindings and secrets.
+   * @param ctx - Execution context, used to keep the work alive.
+   */
   async scheduled(
     _event: ScheduledController,
     env: Env,
@@ -116,30 +162,67 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /* -------------------------------------------------------------------------- */
-/* Core                                                                        */
+/* Core                                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Process pending changes for every folder listed in `DROPBOX_SOURCE`.
+ * A failure in one folder is logged and does not block the others.
+ *
+ * @param env - Worker bindings and secrets.
+ */
 async function processChanges(env: Env): Promise<void> {
+  const folders = parseSourceFolders(env.DROPBOX_SOURCE);
   const token = await getAccessToken(env);
-  const cursor = await env.STATE.get("cursor");
+
+  let forwarded = 0;
+  for (const folder of folders) {
+    try {
+      forwarded += await processFolder(env, token, folder);
+    } catch (e) {
+      console.error(`Processing failed for folder "${folder || "/"}"`, e);
+    }
+  }
+
+  console.log(`processChanges done: ${forwarded} file(s) forwarded.`);
+}
+
+/**
+ * Resolve changes in one folder and forward new PDFs to Make.
+ *
+ * The cursor is only advanced when every eligible file was forwarded, so a
+ * failed forward is retried on the next webhook or cron run. Files already
+ * forwarded are skipped thanks to the dedup markers.
+ *
+ * @param env - Worker bindings and secrets.
+ * @param token - Valid Dropbox access token.
+ * @param folder - Normalized Dropbox folder path (`""` for the root).
+ * @returns Number of files forwarded to Make.
+ */
+async function processFolder(
+  env: Env,
+  token: string,
+  folder: string,
+): Promise<number> {
+  const folderLower = folder.toLowerCase();
+  const cursorKey = `cursor:${folderLower}`;
+  const cursor = await env.STATE.get(cursorKey);
 
   const { entries, newCursor } = cursor
-    ? await listChanges(token, cursor)
-    : await listInitialState(env, token);
-
-  await env.STATE.put("cursor", newCursor);
+    ? await listChanges(token, cursor, folder)
+    : await listFolder(token, folder);
 
   if (!cursor) {
     console.log(
-      `Automatically initialized Dropbox cursor with ${entries.length} existing entries.`,
+      `Initialized cursor for "${folder || "/"}" with ${entries.length} existing entries.`,
     );
   }
 
-  const intakeLower = env.DROPBOX_SOURCE.toLowerCase();
   let forwarded = 0;
+  let failed = 0;
 
   for (const entry of entries) {
-    if (!isTargetPdf(entry, intakeLower)) continue;
+    if (!isTargetPdf(entry, folderLower)) continue;
 
     const dedupKey = `seen:${entry.id}:${entry.rev}`;
     if (await env.STATE.get(dedupKey)) {
@@ -153,66 +236,87 @@ async function processChanges(env: Env): Promise<void> {
       forwarded++;
       console.log(`Forwarded to Make: ${entry.path_display}`);
     } catch (e) {
-      // Do not mark as seen, so the cron safety net retries it next cycle.
+      failed++;
       console.error(`Forward failed for ${entry.path_display}`, e);
     }
   }
 
-  console.log(`processChanges done: ${forwarded} file(s) forwarded.`);
-}
-
-async function listInitialState(
-  env: Env,
-  token: string,
-): Promise<{ entries: DbxEntry[]; newCursor: string }> {
-  const source = normalizeDropboxPath(env.DROPBOX_SOURCE);
-
-  let data = await dbx<DbxListResult>(token, "/files/list_folder", {
-    path: source,
-    recursive: false,
-    include_deleted: false,
-  });
-
-  const entries: DbxEntry[] = [...data.entries];
-
-  while (data.has_more) {
-    data = await dbx<DbxListResult>(token, "/files/list_folder/continue", {
-      cursor: data.cursor,
-    });
-
-    entries.push(...data.entries);
-  }
-
-  return {
-    entries,
-    newCursor: data.cursor,
-  };
-}
-
-function normalizeDropboxPath(path: string | undefined): string {
-  const normalized = (path ?? "").trim();
-
-  if (normalized === "" || normalized === "/") {
-    return "";
-  }
-
-  if (!normalized.startsWith("/")) {
-    throw new Error(
-      `DROPBOX_SOURCE must be empty or start with "/": ${normalized}`,
+  if (failed === 0) {
+    await env.STATE.put(cursorKey, newCursor);
+  } else {
+    console.warn(
+      `Cursor for "${folder || "/"}" not advanced: ${failed} forward(s) failed, will retry.`,
     );
   }
 
-  return normalized.replace(/\/+$/, "");
+  return forwarded;
 }
 
-/** Keep only .pdf files that live DIRECTLY in the intake folder (not sub-folders). */
-function isTargetPdf(entry: DbxEntry, intakeLower: string): boolean {
+/**
+ * Parse `DROPBOX_SOURCE` into a list of normalized, unique folder paths.
+ *
+ * @example
+ * parseSourceFolders("/Scans, /Inbox/Invoices/") // ["/Scans", "/Inbox/Invoices"]
+ * parseSourceFolders("")                         // [""] (Dropbox root)
+ *
+ * @param raw - Comma-separated Dropbox paths. Empty or `/` means the root.
+ * @returns Normalized folder paths, deduplicated case-insensitively.
+ * @throws {Error} If a path does not start with `/`.
+ */
+function parseSourceFolders(raw: string | undefined): string[] {
+  const parts = (raw ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+  if (parts.length === 0) return [""];
+
+  const unique = new Map<string, string>();
+  for (const part of parts) {
+    const folder = normalizeDropboxPath(part);
+    unique.set(folder.toLowerCase(), folder);
+  }
+  return [...unique.values()];
+}
+
+/**
+ * Normalize a Dropbox folder path for the API: trims whitespace and trailing
+ * slashes, and maps the root (`/`) to `""` as Dropbox expects.
+ *
+ * @param path - Raw folder path.
+ * @returns Normalized path.
+ * @throws {Error} If the path is neither empty nor starts with `/`.
+ */
+function normalizeDropboxPath(path: string): string {
+  const trimmed = path.trim();
+  if (trimmed === "" || trimmed === "/") return "";
+
+  if (!trimmed.startsWith("/")) {
+    throw new Error(`DROPBOX_SOURCE paths must start with "/": ${trimmed}`);
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+
+/**
+ * Keep only `.pdf` files that live DIRECTLY in the watched folder.
+ *
+ * @param entry - Dropbox metadata entry.
+ * @param folderLower - Lower-cased normalized folder path.
+ * @returns `true` if the entry should be forwarded.
+ */
+function isTargetPdf(entry: DbxEntry, folderLower: string): boolean {
   if (entry[".tag"] !== "file") return false; // ignore deletes / folders
   if (!entry.name.toLowerCase().endsWith(".pdf")) return false;
   const parent = entry.path_lower.slice(0, entry.path_lower.lastIndexOf("/"));
-  return parent === intakeLower;
+  return parent === folderLower;
 }
 
+/**
+ * POST a file's metadata to the Make webhook.
+ *
+ * @param env - Worker bindings and secrets (`MAKE_WEBHOOK_URL`, `MAKE_SHARED_SECRET`).
+ * @param entry - Dropbox file entry to forward.
+ * @throws {Error} If Make answers with a non-2xx status.
+ */
 async function forwardToMake(env: Env, entry: DbxEntry): Promise<void> {
   const payload = {
     event: "new_file",
@@ -235,7 +339,7 @@ async function forwardToMake(env: Env, entry: DbxEntry): Promise<void> {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // Make verifies this header so it only accepts events from this Worker.
+      // Make checks this header so it only accepts events from this Worker.
       "X-Make-Apikey": env.MAKE_SHARED_SECRET,
     },
     body: JSON.stringify(payload),
@@ -247,10 +351,17 @@ async function forwardToMake(env: Env, entry: DbxEntry): Promise<void> {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Dropbox API                                                                 */
+/* Dropbox API                                                                */
 /* -------------------------------------------------------------------------- */
 
-/** Return a valid access token, refreshing (and caching in KV) when needed. */
+/**
+ * Return a valid Dropbox access token, refreshing it (and caching it in KV)
+ * when the cached one is missing or expired.
+ *
+ * @param env - Worker bindings and secrets.
+ * @returns A short-lived Dropbox access token.
+ * @throws {Error} If the refresh request fails.
+ */
 async function getAccessToken(env: Env): Promise<string> {
   const cached = await env.STATE.get("token");
   if (cached) {
@@ -261,20 +372,19 @@ async function getAccessToken(env: Env): Promise<string> {
     if (Date.now() < exp) return access_token;
   }
 
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: env.DROPBOX_REFRESH_TOKEN,
-    client_id: env.DROPBOX_APP_KEY,
-    client_secret: env.DROPBOX_APP_SECRET,
-  });
-
   const res = await fetch(DBX_OAUTH, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: env.DROPBOX_REFRESH_TOKEN,
+      client_id: env.DROPBOX_APP_KEY,
+      client_secret: env.DROPBOX_APP_SECRET,
+    }),
   });
-  if (!res.ok)
+  if (!res.ok) {
     throw new Error(`Token refresh failed: ${res.status} ${await res.text()}`);
+  }
 
   const data = (await res.json()) as {
     access_token: string;
@@ -289,37 +399,87 @@ async function getAccessToken(env: Env): Promise<string> {
   return data.access_token;
 }
 
+/**
+ * List the full current content of a folder (non-recursive) and return the
+ * cursor at the end of the listing. Used when no cursor exists yet.
+ *
+ * @param token - Dropbox access token.
+ * @param folder - Normalized folder path (`""` for the root).
+ * @returns All entries and the cursor to resume from.
+ */
+async function listFolder(token: string, folder: string): Promise<ListOutcome> {
+  const first = await dbx<DbxListResult>(token, "/files/list_folder", {
+    path: folder,
+    recursive: false,
+    include_deleted: false,
+  });
+  return drain(token, first);
+}
+
+/**
+ * List changes since `cursor`. If Dropbox reports the cursor as reset
+ * (409 `reset`), fall back to a full listing of the folder.
+ *
+ * @param token - Dropbox access token.
+ * @param cursor - Cursor stored after the previous run.
+ * @param folder - Normalized folder path, used for the reset fallback.
+ * @returns Changed entries and the new cursor.
+ */
 async function listChanges(
   token: string,
   cursor: string,
-): Promise<{ entries: DbxEntry[]; newCursor: string }> {
-  const entries: DbxEntry[] = [];
-  let currentCursor = cursor;
-  let hasMore = true;
-
-  while (hasMore) {
-    const data = await dbx<DbxListResult>(
-      token,
-      "/files/list_folder/continue",
-      {
-        cursor: currentCursor,
-      },
-    );
-    entries.push(...data.entries);
-    currentCursor = data.cursor;
-    hasMore = data.has_more;
+  folder: string,
+): Promise<ListOutcome> {
+  let first: DbxListResult;
+  try {
+    first = await dbx<DbxListResult>(token, "/files/list_folder/continue", {
+      cursor,
+    });
+  } catch (e) {
+    if (e instanceof DropboxError && e.status === 409 && e.body.includes("reset")) {
+      console.warn(`Cursor reset by Dropbox for "${folder || "/"}"; re-listing.`);
+      return listFolder(token, folder);
+    }
+    throw e;
   }
-
-  return { entries, newCursor: currentCursor };
+  return drain(token, first);
 }
 
-/** Minimal Dropbox RPC helper (JSON in / JSON out). */
+/**
+ * Follow `has_more` pages until the listing is complete.
+ *
+ * @param token - Dropbox access token.
+ * @param page - First page already fetched.
+ * @returns All entries across pages and the final cursor.
+ */
+async function drain(token: string, page: DbxListResult): Promise<ListOutcome> {
+  const entries = [...page.entries];
+  while (page.has_more) {
+    page = await dbx<DbxListResult>(token, "/files/list_folder/continue", {
+      cursor: page.cursor,
+    });
+    entries.push(...page.entries);
+  }
+  return { entries, newCursor: page.cursor };
+}
+
+/**
+ * Minimal Dropbox RPC helper (JSON in / JSON out). Retries 429 and 5xx
+ * responses, honouring `Retry-After` or falling back to exponential backoff.
+ *
+ * @typeParam T - Expected response shape.
+ * @param token - Dropbox access token.
+ * @param endpoint - RPC endpoint path, e.g. `/files/list_folder`.
+ * @param args - JSON request body.
+ * @returns Parsed JSON response.
+ * @throws {DropboxError} On a non-retryable error or once retries are exhausted.
+ */
 async function dbx<T>(
   token: string,
   endpoint: string,
   args: unknown,
 ): Promise<T> {
-  for (let attempt = 0; attempt <= MAX_DROPBOX_RETRIES; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     const res = await fetch(`${DBX_API}${endpoint}`, {
       method: "POST",
       headers: {
@@ -329,61 +489,54 @@ async function dbx<T>(
       body: JSON.stringify(args),
     });
 
-    const responseText = await res.text();
+    const body = await res.text();
+    if (res.ok) return JSON.parse(body) as T;
+
     const requestId = res.headers.get("x-dropbox-request-id") ?? "unavailable";
-
-    if (res.ok) {
-      return JSON.parse(responseText) as T;
-    }
-
     const retryable = res.status === 429 || res.status >= 500;
-
-    if (retryable && attempt < MAX_DROPBOX_RETRIES) {
-      const retryAfterHeader = res.headers.get("retry-after");
-      const retryAfterSeconds = retryAfterHeader
-        ? Number(retryAfterHeader)
-        : 2 ** attempt;
-
-      const delayMs =
-        Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-          ? retryAfterSeconds * 1000
-          : 2 ** attempt * 1000;
-
-      console.warn("Dropbox request failed; retrying", {
-        endpoint,
-        status: res.status,
-        requestId,
-        attempt: attempt + 1,
-        delayMs,
-        response: responseText,
-      });
-
-      await sleep(delayMs);
-      continue;
+    if (!retryable || attempt >= MAX_DROPBOX_RETRIES) {
+      throw new DropboxError(endpoint, res.status, body, requestId);
     }
 
-    throw new Error(
-      [
-        `Dropbox ${endpoint} failed`,
-        `status=${res.status}`,
-        `requestId=${requestId}`,
-        `response=${responseText}`,
-      ].join(" "),
-    );
-  }
+    const retryAfter = Number(res.headers.get("retry-after"));
+    const delayMs =
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : 2 ** attempt * 1000;
 
-  throw new Error(`Dropbox ${endpoint} exhausted retries`);
+    console.warn("Dropbox request failed; retrying", {
+      endpoint,
+      status: res.status,
+      requestId,
+      attempt: attempt + 1,
+      delayMs,
+      response: body,
+    });
+    await sleep(delayMs);
+  }
 }
 
+/**
+ * Wait for the given duration.
+ *
+ * @param ms - Delay in milliseconds.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /* -------------------------------------------------------------------------- */
-/* Signature verification                                                      */
+/* Signature verification                                                     */
 /* -------------------------------------------------------------------------- */
 
-/** Verify the HMAC-SHA256 signature Dropbox sends in X-Dropbox-Signature (hex). */
+/**
+ * Verify the HMAC-SHA256 signature Dropbox sends in `X-Dropbox-Signature`.
+ *
+ * @param raw - Raw request body, exactly as received.
+ * @param signatureHex - Hex-encoded signature from the header.
+ * @param secret - Dropbox app secret used as HMAC key.
+ * @returns `true` if the signature matches.
+ */
 async function verifySignature(
   raw: string,
   signatureHex: string,
@@ -391,18 +544,15 @@ async function verifySignature(
 ): Promise<boolean> {
   if (!signatureHex) return false;
 
+  const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secret),
+    encoder.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  const mac = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(raw),
-  );
+  const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(raw));
   const expectedHex = [...new Uint8Array(mac)]
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -410,7 +560,13 @@ async function verifySignature(
   return timingSafeEqual(expectedHex, signatureHex.toLowerCase());
 }
 
-/** Constant-time string comparison. */
+/**
+ * Constant-time string comparison (for equal-length inputs).
+ *
+ * @param a - First string.
+ * @param b - Second string.
+ * @returns `true` if both strings are identical.
+ */
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;

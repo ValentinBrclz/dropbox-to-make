@@ -33,6 +33,8 @@ State is stored in the `STATE` KV namespace (per-folder cursors, cached access t
 5. **Deploy**: `npm run deploy`.
 6. **Webhook**: add the Worker URL under **Webhooks** in the Dropbox App Console. The Worker answers the verification challenge automatically.
 
+**Switching to another Dropbox app** (e.g. from Full Dropbox to App folder): set `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET` and a new `DROPBOX_REFRESH_TOKEN` from the new app, remove the Worker URL from the old app's webhooks (otherwise its notifications are logged as `signature mismatch`), and delete the `cursor:*` keys from the `STATE` namespace. With an App folder app, `DROPBOX_SOURCE` paths are relative to the app folder (`/` = `/Apps/<app name>`).
+
 For local development, copy `dev.vars.example` to `.dev.vars` and run `npm run dev`.
 
 ## Behaviour

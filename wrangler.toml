@@ -18,13 +18,15 @@ crons = ["*/30 * * * *"]
 [observability]
 enabled = true
 
+[vars]
+DROPBOX_SOURCE = "/"
+
 # Secrets are NOT stored here. Set them with `wrangler secret put`:
 [secrets]
 required = [
   "DROPBOX_APP_KEY",
   "DROPBOX_APP_SECRET",
   "DROPBOX_REFRESH_TOKEN",
-  "DROPBOX_SOURCE",
   "MAKE_WEBHOOK_URL",
   "MAKE_SHARED_SECRET",
 ]

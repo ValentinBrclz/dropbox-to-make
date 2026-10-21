@@ -18,9 +18,16 @@
  * non-recursively. An empty value or `/` means the Dropbox root.
  *
  * State (Cloudflare KV, binding STATE):
- *   - `cursor:<folder>`  : Dropbox list_folder cursor, one per watched folder
+ *   - `cursor:<folder>`  : folder state, one per watched folder
+ *                          (JSON: {cursor, since}; a bare cursor string is
+ *                          still accepted for backward compatibility)
  *   - `token`            : cached Dropbox access token (JSON: {access_token, exp})
  *   - `seen:<id>:<rev>`  : dedup marker with a 24h TTL
+ *
+ * KV writes are capped at 1,000/day on the Workers Free plan, so the Worker
+ * only writes when something actually changed: a folder's cursor is saved only
+ * when its listing returned entries, and the access token is also cached in
+ * memory to avoid needless KV traffic.
  *
  * A single Dropbox account is assumed (one refresh token).
  *
@@ -55,6 +62,25 @@ interface DbxListResult {
 interface ListOutcome {
   entries: DbxEntry[];
   newCursor: string;
+  /** `true` when Dropbox reset the cursor and the folder was fully re-listed. */
+  reset: boolean;
+}
+
+/** Per-folder state stored under `cursor:<folder>`. */
+interface FolderState {
+  cursor: string;
+  /**
+   * Epoch ms at which the listing that produced `cursor` started. Files
+   * modified before it were already seen; used to avoid re-forwarding the
+   * whole folder after a cursor reset. `0` when unknown.
+   */
+  since: number;
+}
+
+/** Cached Dropbox access token. */
+interface CachedToken {
+  access_token: string;
+  exp: number;
 }
 
 /** Error raised when a Dropbox API call fails with a non-retryable status. */
@@ -88,6 +114,21 @@ const DBX_OAUTH = "https://api.dropbox.com/oauth2/token";
 const SEEN_TTL_SECONDS = 60 * 60 * 24;
 /** Retries for 429 / 5xx Dropbox responses (on top of the first attempt). */
 const MAX_DROPBOX_RETRIES = 4;
+/**
+ * Upper bound for a single retry delay. Background work only has ~30s after
+ * the webhook response, so an unbounded `Retry-After` would get it killed.
+ */
+const MAX_RETRY_DELAY_MS = 5_000;
+/** Timeout for the Make webhook call. */
+const MAKE_TIMEOUT_MS = 10_000;
+/**
+ * Safety margin applied to `FolderState.since` after a cursor reset, to absorb
+ * clock skew between Cloudflare and Dropbox `server_modified`.
+ */
+const RESET_SKEW_MS = 5 * 60 * 1000;
+
+/** In-memory token cache, shared by requests served by the same isolate. */
+let memoryToken: CachedToken | undefined;
 
 /* -------------------------------------------------------------------------- */
 /* Entry points                                                               */
@@ -173,12 +214,21 @@ export default {
  */
 async function processChanges(env: Env): Promise<void> {
   const folders = parseSourceFolders(env.DROPBOX_SOURCE);
-  const token = await getAccessToken(env);
+  let token = await getAccessToken(env);
 
   let forwarded = 0;
   for (const folder of folders) {
     try {
-      forwarded += await processFolder(env, token, folder);
+      try {
+        forwarded += await processFolder(env, token, folder);
+      } catch (e) {
+        // The cached token may have been revoked or expired early: refresh
+        // it once and retry the folder.
+        if (!(e instanceof DropboxError && e.status === 401)) throw e;
+        console.warn("Dropbox token rejected (401); refreshing and retrying.");
+        token = await getAccessToken(env, true);
+        forwarded += await processFolder(env, token, folder);
+      }
     } catch (e) {
       console.error(`Processing failed for folder "${folder || "/"}"`, e);
     }
@@ -194,6 +244,12 @@ async function processChanges(env: Env): Promise<void> {
  * failed forward is retried on the next webhook or cron run. Files already
  * forwarded are skipped thanks to the dedup markers.
  *
+ * To save KV writes, the cursor is not saved when the listing returned no
+ * entries: the previous cursor stays valid and simply yields nothing new.
+ *
+ * After a cursor reset, only files modified since the previous listing are
+ * forwarded, so the whole folder is not sent to Make again.
+ *
  * @param env - Worker bindings and secrets.
  * @param token - Valid Dropbox access token.
  * @param folder - Normalized Dropbox folder path (`""` for the root).
@@ -206,23 +262,30 @@ async function processFolder(
 ): Promise<number> {
   const folderLower = folder.toLowerCase();
   const cursorKey = `cursor:${folderLower}`;
-  const cursor = await env.STATE.get(cursorKey);
+  const state = parseFolderState(await env.STATE.get(cursorKey));
+  const startedAt = Date.now();
 
-  const { entries, newCursor } = cursor
-    ? await listChanges(token, cursor, folder)
+  const { entries, newCursor, reset } = state
+    ? await listChanges(token, state.cursor, folder)
     : await listFolder(token, folder);
 
-  if (!cursor) {
+  if (!state) {
     console.log(
       `Initialized cursor for "${folder || "/"}" with ${entries.length} existing entries.`,
     );
   }
+
+  // After a reset, skip files that predate the previous listing (they were
+  // already handled). Without a known timestamp, fall back to forwarding all.
+  const resetCutoff =
+    reset && state && state.since > 0 ? state.since - RESET_SKEW_MS : 0;
 
   let forwarded = 0;
   let failed = 0;
 
   for (const entry of entries) {
     if (!isTargetPdf(entry, folderLower)) continue;
+    if (resetCutoff && modifiedBefore(entry, resetCutoff)) continue;
 
     const dedupKey = `seen:${entry.id}:${entry.rev}`;
     if (await env.STATE.get(dedupKey)) {
@@ -242,7 +305,12 @@ async function processFolder(
   }
 
   if (failed === 0) {
-    await env.STATE.put(cursorKey, newCursor);
+    // Nothing listed means nothing to remember: keep the old cursor and save
+    // a KV write. A reset always re-saves, since the old cursor is invalid.
+    if (!state || reset || (entries.length > 0 && newCursor !== state.cursor)) {
+      const next: FolderState = { cursor: newCursor, since: startedAt };
+      await env.STATE.put(cursorKey, JSON.stringify(next));
+    }
   } else {
     console.warn(
       `Cursor for "${folder || "/"}" not advanced: ${failed} forward(s) failed, will retry.`,
@@ -311,6 +379,42 @@ function isTargetPdf(entry: DbxEntry, folderLower: string): boolean {
 }
 
 /**
+ * Parse the value stored under `cursor:<folder>`. Accepts the JSON
+ * {@link FolderState} and, for backward compatibility, a bare cursor string.
+ *
+ * @param raw - Stored value, or `null` if the key is missing.
+ * @returns The folder state, or `undefined` if none is stored.
+ */
+function parseFolderState(raw: string | null): FolderState | undefined {
+  if (!raw) return undefined;
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<FolderState>;
+      if (typeof parsed.cursor === "string" && parsed.cursor) {
+        return { cursor: parsed.cursor, since: Number(parsed.since) || 0 };
+      }
+    } catch {
+      // Fall through: treat as corrupted and start over.
+    }
+    console.warn("Ignoring unreadable folder state; re-initializing.");
+    return undefined;
+  }
+  return { cursor: raw, since: 0 };
+}
+
+/**
+ * Whether a file was last modified on Dropbox strictly before `cutoff`.
+ *
+ * @param entry - Dropbox file entry.
+ * @param cutoff - Epoch ms.
+ * @returns `false` when the modification time is unknown.
+ */
+function modifiedBefore(entry: DbxEntry, cutoff: number): boolean {
+  const modified = Date.parse(entry.server_modified ?? "");
+  return Number.isFinite(modified) && modified < cutoff;
+}
+
+/**
  * POST a file's metadata to the Make webhook.
  *
  * @param env - Worker bindings and secrets (`MAKE_WEBHOOK_URL`, `MAKE_SHARED_SECRET`).
@@ -343,6 +447,7 @@ async function forwardToMake(env: Env, entry: DbxEntry): Promise<void> {
       "X-Make-Apikey": env.MAKE_SHARED_SECRET,
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(MAKE_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -355,21 +460,28 @@ async function forwardToMake(env: Env, entry: DbxEntry): Promise<void> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Return a valid Dropbox access token, refreshing it (and caching it in KV)
- * when the cached one is missing or expired.
+ * Return a valid Dropbox access token, refreshing it when the cached one is
+ * missing or expired. The token is cached in memory first, then in KV.
  *
  * @param env - Worker bindings and secrets.
+ * @param forceRefresh - Ignore cached tokens (e.g. after a 401).
  * @returns A short-lived Dropbox access token.
  * @throws {Error} If the refresh request fails.
  */
-async function getAccessToken(env: Env): Promise<string> {
-  const cached = await env.STATE.get("token");
-  if (cached) {
-    const { access_token, exp } = JSON.parse(cached) as {
-      access_token: string;
-      exp: number;
-    };
-    if (Date.now() < exp) return access_token;
+async function getAccessToken(
+  env: Env,
+  forceRefresh = false,
+): Promise<string> {
+  if (!forceRefresh) {
+    if (memoryToken && Date.now() < memoryToken.exp) {
+      return memoryToken.access_token;
+    }
+
+    const cached = parseCachedToken(await env.STATE.get("token"));
+    if (cached && Date.now() < cached.exp) {
+      memoryToken = cached;
+      return cached.access_token;
+    }
   }
 
   const res = await fetch(DBX_OAUTH, {
@@ -392,11 +504,28 @@ async function getAccessToken(env: Env): Promise<string> {
   };
   // Refresh a minute early to avoid edge expiry.
   const exp = Date.now() + (data.expires_in - 60) * 1000;
-  await env.STATE.put(
-    "token",
-    JSON.stringify({ access_token: data.access_token, exp }),
-  );
+  memoryToken = { access_token: data.access_token, exp };
+  await env.STATE.put("token", JSON.stringify(memoryToken));
   return data.access_token;
+}
+
+/**
+ * Parse the KV `token` value, tolerating a missing or corrupted entry.
+ *
+ * @param raw - Stored value, or `null`.
+ * @returns The cached token, or `undefined` if unusable.
+ */
+function parseCachedToken(raw: string | null): CachedToken | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Partial<CachedToken>;
+    if (typeof parsed.access_token === "string" && typeof parsed.exp === "number") {
+      return { access_token: parsed.access_token, exp: parsed.exp };
+    }
+  } catch {
+    // Corrupted value: a fresh token will be fetched.
+  }
+  return undefined;
 }
 
 /**
@@ -413,7 +542,7 @@ async function listFolder(token: string, folder: string): Promise<ListOutcome> {
     recursive: false,
     include_deleted: false,
   });
-  return drain(token, first);
+  return drain(token, first, false);
 }
 
 /**
@@ -436,13 +565,31 @@ async function listChanges(
       cursor,
     });
   } catch (e) {
-    if (e instanceof DropboxError && e.status === 409 && e.body.includes("reset")) {
+    if (e instanceof DropboxError && isCursorReset(e)) {
       console.warn(`Cursor reset by Dropbox for "${folder || "/"}"; re-listing.`);
-      return listFolder(token, folder);
+      const relisted = await listFolder(token, folder);
+      return { ...relisted, reset: true };
     }
     throw e;
   }
-  return drain(token, first);
+  return drain(token, first, false);
+}
+
+/**
+ * Whether a Dropbox error is the `list_folder/continue` "reset" error, i.e.
+ * the cursor is no longer valid and the folder must be listed again.
+ *
+ * @param e - Dropbox error.
+ * @returns `true` for a 409 whose `error_summary` starts with `reset`.
+ */
+function isCursorReset(e: DropboxError): boolean {
+  if (e.status !== 409) return false;
+  try {
+    const parsed = JSON.parse(e.body) as { error_summary?: string };
+    return parsed.error_summary?.startsWith("reset") ?? false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -450,9 +597,14 @@ async function listChanges(
  *
  * @param token - Dropbox access token.
  * @param page - First page already fetched.
+ * @param reset - Value to report as {@link ListOutcome.reset}.
  * @returns All entries across pages and the final cursor.
  */
-async function drain(token: string, page: DbxListResult): Promise<ListOutcome> {
+async function drain(
+  token: string,
+  page: DbxListResult,
+  reset: boolean,
+): Promise<ListOutcome> {
   const entries = [...page.entries];
   while (page.has_more) {
     page = await dbx<DbxListResult>(token, "/files/list_folder/continue", {
@@ -460,7 +612,7 @@ async function drain(token: string, page: DbxListResult): Promise<ListOutcome> {
     });
     entries.push(...page.entries);
   }
-  return { entries, newCursor: page.cursor };
+  return { entries, newCursor: page.cursor, reset };
 }
 
 /**
@@ -499,10 +651,12 @@ async function dbx<T>(
     }
 
     const retryAfter = Number(res.headers.get("retry-after"));
-    const delayMs =
+    const delayMs = Math.min(
       Number.isFinite(retryAfter) && retryAfter > 0
         ? retryAfter * 1000
-        : 2 ** attempt * 1000;
+        : 2 ** attempt * 1000,
+      MAX_RETRY_DELAY_MS,
+    );
 
     console.warn("Dropbox request failed; retrying", {
       endpoint,

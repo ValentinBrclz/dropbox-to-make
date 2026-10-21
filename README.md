@@ -15,7 +15,7 @@ It verifies the Dropbox signature, resolves what changed using a stored cursor p
 | `MAKE_WEBHOOK_URL`      | Make custom webhook URL.                                                                                       |
 | `MAKE_SHARED_SECRET`    | Random string sent as `X-Make-Apikey`; filter on it in Make.                                                   |
 
-State is stored in the `STATE` KV namespace (cursors, cached access token, 24h dedup markers).
+State is stored in the `STATE` KV namespace (per-folder cursors, cached access token, 24h dedup markers).
 
 ## Setup
 
@@ -40,6 +40,9 @@ For local development, copy `dev.vars.example` to `.dev.vars` and run `npm run d
 - The first run for a folder forwards the PDFs already in it, then only new ones.
 - A folder's cursor only advances when every forward succeeded; failures are retried on the next webhook or cron run.
 - A cron (`*/30 * * * *` in `wrangler.toml`) reconciles in case a webhook is missed. Remove it to rely on webhooks only.
+- KV writes are kept to a minimum (the Workers Free plan allows 1,000/day): a folder's cursor is only saved when its listing returned entries, so webhooks for changes elsewhere in Dropbox and idle cron runs cost no writes. Each forwarded PDF costs one write (dedup marker).
+- If Dropbox resets a folder's cursor, the folder is re-listed but only files modified since the previous listing are forwarded.
+- A modified PDF (new `rev`) is forwarded again with `event: "new_file"`.
 - Moving a processed file out of a watched folder (e.g. into a sub-folder) does not re-trigger it.
 
 ## Payload sent to Make

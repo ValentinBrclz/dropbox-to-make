@@ -166,8 +166,19 @@ export default {
       const raw = await request.text();
       const signature = request.headers.get("X-Dropbox-Signature") ?? "";
 
-      if (!(await verifySignature(raw, signature, env.DROPBOX_APP_SECRET))) {
-        console.warn("Rejected webhook: invalid signature");
+      if (!signature) {
+        // Usually a scanner or a manual request, not Dropbox.
+        console.warn("Rejected webhook: missing X-Dropbox-Signature header");
+        return new Response("invalid signature", { status: 403 });
+      }
+
+      if (!(await verifySignature(raw, signature, env.DROPBOX_APP_SECRET.trim()))) {
+        // A real Dropbox notification signed with another secret: the webhook
+        // is registered on an app whose secret differs from DROPBOX_APP_SECRET.
+        console.warn("Rejected webhook: signature mismatch", {
+          bodyLength: raw.length,
+          looksLikeDropbox: raw.includes('"list_folder"'),
+        });
         return new Response("invalid signature", { status: 403 });
       }
 
@@ -489,9 +500,10 @@ async function getAccessToken(
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: env.DROPBOX_REFRESH_TOKEN,
-      client_id: env.DROPBOX_APP_KEY,
-      client_secret: env.DROPBOX_APP_SECRET,
+      // Trim to tolerate whitespace pasted into `wrangler secret put`.
+      refresh_token: env.DROPBOX_REFRESH_TOKEN.trim(),
+      client_id: env.DROPBOX_APP_KEY.trim(),
+      client_secret: env.DROPBOX_APP_SECRET.trim(),
     }),
   });
   if (!res.ok) {

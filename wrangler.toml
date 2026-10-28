@@ -15,7 +15,21 @@ id = "6ef0bc9a09da4bb58b69ac0e5394d4fc"
 [triggers]
 crons = ["*/30 * * * *"]
 
+# Observability. Query strings (the Dropbox webhook challenge) are redacted.
 [observability]
+enabled = true
+redact_query_string = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.01
+
+[observability.issues]
 enabled = true
 
 [vars]
